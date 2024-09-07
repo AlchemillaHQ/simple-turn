@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/pion/turn/v4"
@@ -28,6 +27,26 @@ func StartServer(config *Config) error {
 
 	realm := config.Realm
 
+	// Parse IPv4 address
+	ipv4, _, err := net.SplitHostPort(config.IPv4Bind)
+	if err != nil {
+		return fmt.Errorf("failed to parse IPv4 bind address: %v", err)
+	}
+	ipv4Addr := net.ParseIP(ipv4)
+	if ipv4Addr == nil {
+		return fmt.Errorf("invalid IPv4 address: %s", ipv4)
+	}
+
+	// Parse IPv6 address
+	ipv6, _, err := net.SplitHostPort(config.IPv6Bind)
+	if err != nil {
+		return fmt.Errorf("failed to parse IPv6 bind address: %v", err)
+	}
+	ipv6Addr := net.ParseIP(ipv6)
+	if ipv6Addr == nil {
+		return fmt.Errorf("invalid IPv6 address: %s", ipv6)
+	}
+
 	_, err = turn.NewServer(turn.ServerConfig{
 		Realm: realm,
 		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
@@ -49,14 +68,14 @@ func StartServer(config *Config) error {
 			{
 				PacketConn: udpListenerIPv4,
 				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: net.ParseIP(strings.Split(config.IPv4Bind, ":")[0]),
+					RelayAddress: ipv4Addr,
 					Address:      "0.0.0.0",
 				},
 			},
 			{
 				PacketConn: udpListenerIPv6,
 				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(config.IPv6Bind, "["), "]")),
+					RelayAddress: ipv6Addr,
 					Address:      "::",
 				},
 			},
