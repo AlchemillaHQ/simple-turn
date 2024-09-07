@@ -37,14 +37,12 @@ func StartServer(config *Config) error {
 				return nil, false
 			}
 			defer resp.Body.Close()
-
 			if resp.StatusCode != http.StatusOK {
 				logrus.Infof("Authentication failed for token %s", username)
 				return nil, false
 			} else {
 				logrus.Debugf("Authentication succeeded for token %s", username)
 			}
-
 			return turn.GenerateAuthKey(username, realm, username), true
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{
@@ -58,7 +56,7 @@ func StartServer(config *Config) error {
 			{
 				PacketConn: udpListenerIPv6,
 				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: net.ParseIP(strings.Split(config.IPv6Bind, "]")[0][1:]),
+					RelayAddress: net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(config.IPv6Bind, "["), "]")),
 					Address:      "::",
 				},
 			},
@@ -69,6 +67,5 @@ func StartServer(config *Config) error {
 	}
 
 	logrus.Infof("STUN/TURN server is running on %s (IPv4) and %s (IPv6)", config.IPv4Bind, config.IPv6Bind)
-
 	select {}
 }
