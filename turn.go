@@ -13,22 +13,8 @@ import (
 var httpClient = &http.Client{Timeout: 5 * time.Second}
 
 func StartServer(config *Config) error {
-	udpListenerIPv4, err := net.ListenPacket("udp4", config.IPv4Bind)
-	if err != nil {
-		return fmt.Errorf("failed to create UDP listener for IPv4: %v", err)
-	}
-	defer udpListenerIPv4.Close()
-
-	udpListenerIPv6, err := net.ListenPacket("udp6", config.IPv6Bind)
-	if err != nil {
-		return fmt.Errorf("failed to create UDP listener for IPv6: %v", err)
-	}
-	defer udpListenerIPv6.Close()
-
-	realm := config.Realm
-
 	// Parse IPv4 address
-	ipv4, _, err := net.SplitHostPort(config.IPv4Bind)
+	ipv4, portv4, err := net.SplitHostPort(config.IPv4Bind)
 	if err != nil {
 		return fmt.Errorf("failed to parse IPv4 bind address: %v", err)
 	}
@@ -38,7 +24,7 @@ func StartServer(config *Config) error {
 	}
 
 	// Parse IPv6 address
-	ipv6, _, err := net.SplitHostPort(config.IPv6Bind)
+	ipv6, portv6, err := net.SplitHostPort(config.IPv6Bind)
 	if err != nil {
 		return fmt.Errorf("failed to parse IPv6 bind address: %v", err)
 	}
@@ -47,7 +33,9 @@ func StartServer(config *Config) error {
 		return fmt.Errorf("invalid IPv6 address: %s", ipv6)
 	}
 
-	_, err = turn.NewServer(turn.ServerConfig{
+	realm := config.Realm
+
+	serverConfig := turn.ServerConfig{
 		Realm: realm,
 		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
 			resp, err := httpClient.Get(fmt.Sprintf("%s/%s", config.AuthEndpoint, username))
@@ -64,27 +52,48 @@ func StartServer(config *Config) error {
 			}
 			return turn.GenerateAuthKey(username, realm, username), true
 		},
-		PacketConnConfigs: []turn.PacketConnConfig{
-			{
-				PacketConn: udpListenerIPv4,
-				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: ipv4Addr,
-					Address:      "0.0.0.0",
-				},
+	}
+
+	// IPv4 configuration
+	if ipv4Addr != nil {
+		udpListenerIPv4, err := net.ListenPacket("udp4", net.JoinHostPort(ipv4, portv4))
+		if err != nil {
+			return fmt.Errorf("failed to create UDP listener for IPv4: %v", err)
+		}
+		defer udpListenerIPv4.Close()
+
+		serverConfig.PacketConnConfigs = append(serverConfig.PacketConnConfigs, turn.PacketConnConfig{
+			PacketConn: udpListenerIPv4,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+				RelayAddress: ipv4Addr,
+				Address:      "0.0.0.0",
 			},
-			{
-				PacketConn: udpListenerIPv6,
-				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: ipv6Addr,
-					Address:      "::",
-				},
+		})
+		logrus.Infof("STUN/TURN server is running on %s (IPv4)", config.IPv4Bind)
+	}
+
+	// IPv6 configuration
+	if ipv6Addr != nil {
+		udpListenerIPv6, err := net.ListenPacket("udp6", net.JoinHostPort(ipv6, portv6))
+		if err != nil {
+			return fmt.Errorf("failed to create UDP listener for IPv6: %v", err)
+		}
+		defer udpListenerIPv6.Close()
+
+		serverConfig.PacketConnConfigs = append(serverConfig.PacketConnConfigs, turn.PacketConnConfig{
+			PacketConn: udpListenerIPv6,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+				RelayAddress: ipv6Addr,
+				Address:      "::",
 			},
-		},
-	})
+		})
+		logrus.Infof("STUN/TURN server is running on %s (IPv6)", config.IPv6Bind)
+	}
+
+	_, err = turn.NewServer(serverConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create STUN/TURN server: %v", err)
 	}
 
-	logrus.Infof("STUN/TURN server is running on %s (IPv4) and %s (IPv6)", config.IPv4Bind, config.IPv6Bind)
 	select {}
 }
