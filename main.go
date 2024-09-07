@@ -35,15 +35,15 @@ func main() {
 		config = &Config{}
 	}
 
-	if *realm != "" {
+	if *realm != "example.stunserver.com" {
 		config.Realm = *realm
 	}
 
-	if *ipv4Bind != "" {
+	if *ipv4Bind != "0.0.0.0:3478" {
 		config.IPv4Bind = *ipv4Bind
 	}
 
-	if *ipv6Bind != "" {
+	if *ipv6Bind != "[::]:3478" {
 		config.IPv6Bind = *ipv6Bind
 	}
 
@@ -51,7 +51,7 @@ func main() {
 		config.AuthEndpoint = *authEndpoint
 	}
 
-	if *logLevel != "" {
+	if *logLevel != "info" {
 		config.LogLevel = *logLevel
 	}
 
