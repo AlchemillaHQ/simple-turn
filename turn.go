@@ -41,6 +41,8 @@ func StartServer(config *Config) error {
 			if resp.StatusCode != http.StatusOK {
 				logrus.Infof("Authentication failed for token %s", username)
 				return nil, false
+			} else {
+				logrus.Debugf("Authentication succeeded for token %s", username)
 			}
 
 			return turn.GenerateAuthKey(username, realm, username), true
