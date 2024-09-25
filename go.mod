@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/mattn/go-sqlite3 v1.14.23 // indirect
 	github.com/pion/dtls/v3 v3.0.2 // indirect
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/randutil v0.1.0 // indirect

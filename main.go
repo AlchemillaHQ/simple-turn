@@ -17,6 +17,7 @@ func main() {
 	ipv6Bind := flag.String("ipv6", "[::]:3478", "IPv6 address and port to bind to")
 	logLevel := flag.String("loglevel", "info", "Log level (debug, info, warn, error)")
 	authEndpoint := flag.String("auth-endpoint", "", "URL to the authentication endpoint")
+	webAddr := flag.String("web-addr", ":8080", "Address for the web server")
 
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.BoolVar(version, "v", false, "Print version and exit (shorthand)")
@@ -62,6 +63,19 @@ func main() {
 
 	logrus.SetLevel(level)
 	logrus.Infof("Configuration: %+v", config)
+
+	err = initDB()
+	if err != nil {
+		logrus.Errorf("Failed to initialize database: %v", err)
+		os.Exit(1)
+	}
+
+	go func() {
+		err := startWebServer(*webAddr)
+		if err != nil {
+			logrus.Errorf("Failed to start web server: %v", err)
+		}
+	}()
 
 	err = StartServer(config)
 	if err != nil {
