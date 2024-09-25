@@ -1,0 +1,8 @@
+{
+  "realm": "stun.difuse.io",
+  "ipv4_bind": "127.0.0.1:3478",
+  "ipv6_bind": "[::1]:3478",
+  "log_level": "debug",
+  "auth_endpoint": "https://portal.difuse.io/verify-identifier-for-turn",
+  "web_addr": ":8080"
+}
