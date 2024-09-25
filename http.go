@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -24,8 +26,12 @@ type Client struct {
 }
 
 var (
-	db *sql.DB
+	db             *sql.DB
+	clientActivity = make(map[string]time.Time)
+	activityMutex  sync.Mutex
 )
+
+const inactivityThreshold = 1 * time.Minute
 
 func initDB() error {
 	var err error
@@ -117,6 +123,11 @@ func logClient(clientType, ip string, active *bool) error {
 func updateClientData(clientType, ip string, dataSent, dataReceived int64) error {
 	logrus.Infof("Updating client data: type=%s, ip=%s, sent=%d, received=%d", clientType, ip, dataSent, dataReceived)
 
+	// Update the last activity time for this client
+	activityMutex.Lock()
+	clientActivity[clientType+":"+ip] = time.Now()
+	activityMutex.Unlock()
+
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
@@ -126,7 +137,7 @@ func updateClientData(clientType, ip string, dataSent, dataReceived int64) error
 	// First, try to update existing record
 	result, err := tx.Exec(`
 		UPDATE clients
-		SET data_sent = data_sent + ?, data_received = data_received + ?, last_connected = CURRENT_TIMESTAMP
+		SET data_sent = data_sent + ?, data_received = data_received + ?, last_connected = CURRENT_TIMESTAMP, active = true
 		WHERE type = ? AND ip = ?
 	`, dataSent, dataReceived, clientType, ip)
 	if err != nil {
@@ -171,6 +182,31 @@ func setClientInactive(clientType, ip string) error {
 	return nil
 }
 
+func checkInactiveClients() {
+	for {
+		time.Sleep(30 * time.Second) // Check every 30 seconds
+
+		activityMutex.Lock()
+		now := time.Now()
+		for key, lastActivity := range clientActivity {
+			if now.Sub(lastActivity) > inactivityThreshold {
+				parts := strings.SplitN(key, ":", 2)
+				if len(parts) == 2 {
+					clientType, ip := parts[0], parts[1]
+					err := setClientInactive(clientType, ip)
+					if err != nil {
+						logrus.Errorf("Failed to set client inactive: %v", err)
+					} else {
+						logrus.Infof("Set client inactive due to inactivity: type=%s, ip=%s", clientType, ip)
+					}
+					delete(clientActivity, key)
+				}
+			}
+		}
+		activityMutex.Unlock()
+	}
+}
+
 func getClients(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
 		SELECT id, type, ip, first_connected, last_connected, count, active, data_sent, data_received
@@ -208,6 +244,8 @@ func getClients(w http.ResponseWriter, r *http.Request) {
 }
 
 func startWebServer(addr string) error {
+	go checkInactiveClients()
+
 	http.HandleFunc("/clients", getClients)
 	logrus.Infof("Starting web server on %s", addr)
 	return http.ListenAndServe(addr, nil)
