@@ -95,28 +95,75 @@ func (g *customRelayAddressGenerator) Validate() error {
 	return nil
 }
 
-func wrapPacketConn(conn net.PacketConn) net.PacketConn {
-	return &loggingPacketConn{PacketConn: conn}
-}
-
-type loggingPacketConn struct {
+type monitoringPacketConn struct {
 	net.PacketConn
+	clientIP string
 }
 
-func (l *loggingPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, addr, err = l.PacketConn.ReadFrom(p)
-	if err == nil && n >= 20 {
-		if p[0]&0xC0 == 0 {
-			ip, _, _ := net.SplitHostPort(addr.String())
-			err := logClient("stun", ip)
-			if err != nil {
-				logrus.Debugf("Failed to log STUN client: %v", err)
-			} else {
-				logrus.Debugf("Logged STUN client: ip=%s", ip)
-			}
-		}
+func (m *monitoringPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = m.PacketConn.ReadFrom(p)
+	if err == nil {
+		updateClientData("turn", m.clientIP, 0, int64(n))
 	}
 	return
+}
+
+func (m *monitoringPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = m.PacketConn.WriteTo(p, addr)
+	if err == nil {
+		updateClientData("turn", m.clientIP, int64(n), 0)
+	}
+	return
+}
+
+type monitoringConn struct {
+	net.Conn
+	clientIP string
+}
+
+func (m *monitoringConn) Read(b []byte) (n int, err error) {
+	n, err = m.Conn.Read(b)
+	if err == nil {
+		updateClientData("turn", m.clientIP, 0, int64(n))
+	}
+	return
+}
+
+func (m *monitoringConn) Write(b []byte) (n int, err error) {
+	n, err = m.Conn.Write(b)
+	if err == nil {
+		updateClientData("turn", m.clientIP, int64(n), 0)
+	}
+	return
+}
+
+func wrapPacketConn(conn net.PacketConn, clientIP string) net.PacketConn {
+	return &monitoringPacketConn{PacketConn: conn, clientIP: clientIP}
+}
+
+func wrapConn(conn net.Conn, clientIP string) net.Conn {
+	return &monitoringConn{Conn: conn, clientIP: clientIP}
+}
+
+type customRelayListener struct {
+	turn.RelayAddressGenerator
+	clientIP string
+}
+
+func (g *customRelayListener) AllocatePacketConn(network string, requestedPort int) (net.PacketConn, net.Addr, error) {
+	conn, addr, err := g.RelayAddressGenerator.AllocatePacketConn(network, requestedPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapPacketConn(conn, g.clientIP), addr, nil
+}
+
+func (g *customRelayListener) AllocateConn(network string, requestedPort int) (net.Conn, net.Addr, error) {
+	conn, addr, err := g.RelayAddressGenerator.AllocateConn(network, requestedPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapConn(conn, g.clientIP), addr, nil
 }
 
 func StartServer(config *Config) error {
@@ -196,21 +243,21 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 	s, err := turn.NewServer(turn.ServerConfig{
 		Realm: config.Realm,
 		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
-			logrus.Infof("TURN Auth request: username=%s, realm=%s, srcAddr=%s", username, realm, srcAddr.String())
+			logrus.Debugf("TURN Auth request: username=%s, realm=%s, srcAddr=%s", username, realm, srcAddr.String())
 
 			resp, err := httpClient.Get(fmt.Sprintf("%s/%s", config.AuthEndpoint, username))
 			if err != nil {
-				logrus.Errorf("TURN Auth request failed: %v", err)
+				logrus.Debugf("TURN Auth request failed: %v", err)
 				return nil, false
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				logrus.Warnf("TURN Auth request denied: status=%d", resp.StatusCode)
+				logrus.Debugf("TURN Auth request denied: status=%d", resp.StatusCode)
 				return nil, false
 			}
 
 			ip, _, _ := net.SplitHostPort(srcAddr.String())
-			err = logClient("turn", ip)
+			err = logClient("turn", ip, true)
 			if err != nil {
 				logrus.Errorf("Failed to log TURN client connection: %v", err)
 			} else {
@@ -221,21 +268,25 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
-				PacketConn: wrapPacketConn(udpListener),
-				RelayAddressGenerator: &customRelayAddressGenerator{
-					relayAddress: relayIP,
-					address:      publicIP,
-					isIPv6:       isIPv6,
+				PacketConn: udpListener,
+				RelayAddressGenerator: &customRelayListener{
+					RelayAddressGenerator: &customRelayAddressGenerator{
+						relayAddress: relayIP,
+						address:      publicIP,
+						isIPv6:       isIPv6,
+					},
 				},
 			},
 		},
 		ListenerConfigs: []turn.ListenerConfig{
 			{
 				Listener: tcpListener,
-				RelayAddressGenerator: &customRelayAddressGenerator{
-					relayAddress: relayIP,
-					address:      publicIP,
-					isIPv6:       isIPv6,
+				RelayAddressGenerator: &customRelayListener{
+					RelayAddressGenerator: &customRelayAddressGenerator{
+						relayAddress: relayIP,
+						address:      publicIP,
+						isIPv6:       isIPv6,
+					},
 				},
 			},
 		},

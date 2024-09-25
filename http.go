@@ -19,7 +19,9 @@ type Client struct {
 	FirstConnected time.Time `json:"first_connected"`
 	LastConnected  time.Time `json:"last_connected"`
 	Count          int       `json:"count"`
-	Active         *bool     `json:"active"`
+	Active         bool      `json:"active"`
+	DataSent       int64     `json:"data_sent"`
+	DataReceived   int64     `json:"data_received"`
 }
 
 var (
@@ -35,17 +37,19 @@ func initDB() error {
 	}
 
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS clients (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			type TEXT,
-			ip TEXT,
-			first_connected DATETIME,
-			last_connected DATETIME,
-			count INTEGER,
-			active BOOLEAN,
-			UNIQUE(type, ip)
-		)
-	`)
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT,
+            ip TEXT,
+            first_connected DATETIME,
+            last_connected DATETIME,
+            count INTEGER,
+            active BOOLEAN,
+            data_sent INTEGER,
+            data_received INTEGER,
+            UNIQUE(type, ip)
+        )
+    `)
 	if err != nil {
 		return fmt.Errorf("failed to create table: %v", err)
 	}
@@ -53,7 +57,7 @@ func initDB() error {
 	return nil
 }
 
-func logClient(clientType, ip string) error {
+func logClient(clientType, ip string, active bool) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
@@ -62,20 +66,12 @@ func logClient(clientType, ip string) error {
 
 	now := time.Now()
 
-	if clientType == "turn" {
-		// For TURN, set all previous active connections for this IP to inactive
-		_, err = tx.Exec("UPDATE clients SET active = FALSE WHERE ip = ? AND type = 'turn' AND active = TRUE", ip)
-		if err != nil {
-			return fmt.Errorf("failed to update existing TURN clients: %v", err)
-		}
-	}
-
 	// Try to update existing record
 	result, err := tx.Exec(`
-		UPDATE clients 
-		SET last_connected = ?, count = count + 1, active = CASE WHEN type = 'turn' THEN TRUE ELSE active END
-		WHERE type = ? AND ip = ?
-	`, now, clientType, ip)
+        UPDATE clients
+        SET last_connected = ?, count = count + 1, active = ?
+        WHERE type = ? AND ip = ?
+    `, now, active, clientType, ip)
 	if err != nil {
 		return fmt.Errorf("failed to update client: %v", err)
 	}
@@ -87,16 +83,10 @@ func logClient(clientType, ip string) error {
 
 	if rowsAffected == 0 {
 		// If no existing record, insert new one
-		var active *bool
-		if clientType == "turn" {
-			trueVal := true
-			active = &trueVal
-		}
-
 		_, err = tx.Exec(`
-			INSERT INTO clients (type, ip, first_connected, last_connected, count, active) 
-			VALUES (?, ?, ?, ?, 1, ?)
-		`, clientType, ip, now, now, active)
+            INSERT INTO clients (type, ip, first_connected, last_connected, count, active, data_sent, data_received)
+            VALUES (?, ?, ?, ?, 1, ?, 0, 0)
+        `, clientType, ip, now, now, active)
 		if err != nil {
 			return fmt.Errorf("failed to insert client: %v", err)
 		}
@@ -110,13 +100,27 @@ func logClient(clientType, ip string) error {
 	return nil
 }
 
+func updateClientData(clientType, ip string, dataSent, dataReceived int64) error {
+	_, err := db.Exec(`
+        UPDATE clients
+        SET data_sent = data_sent + ?, data_received = data_received + ?, last_connected = CURRENT_TIMESTAMP
+        WHERE type = ? AND ip = ?
+    `, dataSent, dataReceived, clientType, ip)
+
+	if err != nil {
+		return fmt.Errorf("failed to update client data: %v", err)
+	}
+
+	return nil
+}
+
 func getClients(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-		SELECT id, type, ip, first_connected, last_connected, count, active 
-		FROM clients 
-		ORDER BY last_connected DESC
-		LIMIT 100
-	`)
+        SELECT id, type, ip, first_connected, last_connected, count, active, data_sent, data_received
+        FROM clients
+        ORDER BY last_connected DESC
+        LIMIT 100
+    `)
 	if err != nil {
 		logrus.Errorf("Failed to query clients: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to query clients: %v", err), http.StatusInternalServerError)
@@ -127,15 +131,11 @@ func getClients(w http.ResponseWriter, r *http.Request) {
 	var clients []Client
 	for rows.Next() {
 		var c Client
-		var activeNull sql.NullBool
-		err := rows.Scan(&c.ID, &c.Type, &c.IP, &c.FirstConnected, &c.LastConnected, &c.Count, &activeNull)
+		err := rows.Scan(&c.ID, &c.Type, &c.IP, &c.FirstConnected, &c.LastConnected, &c.Count, &c.Active, &c.DataSent, &c.DataReceived)
 		if err != nil {
 			logrus.Errorf("Failed to scan row: %v", err)
 			http.Error(w, fmt.Sprintf("Failed to scan row: %v", err), http.StatusInternalServerError)
 			return
-		}
-		if activeNull.Valid {
-			c.Active = &activeNull.Bool
 		}
 		clients = append(clients, c)
 	}
