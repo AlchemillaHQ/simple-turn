@@ -17,6 +17,14 @@ func main() {
 		logrus.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	level, err := logrus.ParseLevel(cfg.LogLevel)
+
+	if err != nil {
+		level = logrus.InfoLevel
+	}
+
+	logrus.SetLevel(level)
+
 	if err := db.InitDB(); err != nil {
 		logrus.Fatalf("Failed to initialize database: %v", err)
 	}

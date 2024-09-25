@@ -3,8 +3,12 @@ package turn
 import (
 	"fmt"
 	"net"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/AlchemillaHQ/simple-turn/internal/config"
 	"github.com/pion/logging"
@@ -14,12 +18,14 @@ import (
 )
 
 type STUNTURNServer struct {
-	config *config.Config
+	config       *config.Config
+	httpClient   *http.Client
+	sessionStats map[string]*sessionInfo
+	statsMutex   sync.Mutex
 }
 
 func NewSTUNTURNServer(cfg *config.Config) *STUNTURNServer {
-	cfg.Realm = "stun.difuse.io"
-	return &STUNTURNServer{config: cfg}
+	return &STUNTURNServer{config: cfg, httpClient: &http.Client{Timeout: 10 * time.Second}}
 }
 
 func (s *STUNTURNServer) Start() error {
@@ -47,6 +53,11 @@ func (s *STUNTURNServer) Start() error {
 		close(errChan)
 	}()
 
+	go func() {
+		s.startPeriodicStatsUpdate()
+		s.cleanupExpiredAuthKeys()
+	}()
+
 	for err := range errChan {
 		return err
 	}
@@ -68,9 +79,7 @@ func (s *STUNTURNServer) startServer(bindAddress string, isIPv6 bool) error {
 	publicIP := extractIP(bindAddress)
 
 	loggerFactory := logging.NewDefaultLoggerFactory()
-	loggerFactory.DefaultLogLevel = logging.LogLevelError
-
-	wrappedUDPListener := &stunInterceptor{PacketConn: udpListener}
+	loggerFactory.DefaultLogLevel = logging.LogLevelDisabled
 
 	relayAddrGen := &customRelayAddressGenerator{
 		relayAddress: net.ParseIP(publicIP),
@@ -83,13 +92,13 @@ func (s *STUNTURNServer) startServer(bindAddress string, isIPv6 bool) error {
 		AuthHandler: s.handleAuth,
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
-				PacketConn:            wrappedUDPListener,
+				PacketConn:            s.wrapUDPConn(udpListener),
 				RelayAddressGenerator: relayAddrGen,
 			},
 		},
 		ListenerConfigs: []turn.ListenerConfig{
 			{
-				Listener:              tcpListener,
+				Listener:              s.wrapTCPListener(tcpListener),
 				RelayAddressGenerator: relayAddrGen,
 			},
 		},
@@ -105,21 +114,112 @@ func (s *STUNTURNServer) startServer(bindAddress string, isIPv6 bool) error {
 	return nil
 }
 
-type stunInterceptor struct {
-	net.PacketConn
+func (s *STUNTURNServer) wrapUDPConn(conn net.PacketConn) net.PacketConn {
+	return &wrappedPacketConn{PacketConn: conn, server: s}
 }
 
-func (si *stunInterceptor) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, addr, err = si.PacketConn.ReadFrom(p)
+func (s *STUNTURNServer) wrapTCPListener(listener net.Listener) net.Listener {
+	return &wrappedListener{Listener: listener, server: s}
+}
+
+type wrappedPacketConn struct {
+	net.PacketConn
+	server *STUNTURNServer
+}
+
+func (w *wrappedPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = w.PacketConn.ReadFrom(p)
 	if err == nil {
 		msg := &stun.Message{Raw: p[:n]}
 		if err := msg.Decode(); err == nil {
 			if msg.Type.Class == stun.ClassRequest && msg.Type.Method == stun.MethodBinding {
-				logrus.Infof("Received STUN binding request from %s", addr.String())
+				host, _, _ := net.SplitHostPort(addr.String())
+				w.server.updateStunClient(host)
+			} else {
+				// This is likely a TURN message
+				username := "" // You need to extract the username from the TURN message
+				host, _, _ := net.SplitHostPort(addr.String())
+				w.server.updateTurnStats(host, username, 0, int64(n))
 			}
 		}
 	}
 	return
+}
+
+func (w *wrappedPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = w.PacketConn.WriteTo(p, addr)
+	if err == nil {
+		host, _, _ := net.SplitHostPort(addr.String())
+		username := "" // You need to extract the username for the TURN session
+		w.server.updateTurnStats(host, username, int64(n), 0)
+	}
+	return
+}
+
+type wrappedListener struct {
+	net.Listener
+	server *STUNTURNServer
+}
+
+func (w *wrappedListener) Accept() (net.Conn, error) {
+	conn, err := w.Listener.Accept()
+	if err == nil {
+		return &wrappedConn{Conn: conn, server: w.server}, nil
+	}
+	return conn, err
+}
+
+// Update the wrappedConn
+type wrappedConn struct {
+	net.Conn
+	server *STUNTURNServer
+}
+
+func (w *wrappedConn) Read(b []byte) (n int, err error) {
+	n, err = w.Conn.Read(b)
+	if err == nil {
+		host, _, _ := net.SplitHostPort(w.Conn.RemoteAddr().String())
+		username := "" // You need to extract the username for the TURN session
+		w.server.updateTurnStats(host, username, 0, int64(n))
+	}
+	return
+}
+
+func (w *wrappedConn) Write(b []byte) (n int, err error) {
+	n, err = w.Conn.Write(b)
+	if err == nil {
+		host, _, _ := net.SplitHostPort(w.Conn.RemoteAddr().String())
+		username := "" // You need to extract the username for the TURN session
+		w.server.updateTurnStats(host, username, int64(n), 0)
+	}
+	return
+}
+
+func (s *STUNTURNServer) startPeriodicStatsUpdate() {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for range ticker.C {
+			s.flushStats()
+		}
+	}()
+}
+
+func (s *STUNTURNServer) flushStats() {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+
+	for ip, info := range s.sessionStats {
+		s.updateTurnStats(ip, info.username, info.bytesSent, info.bytesReceived)
+		// Reset counters after flushing
+		info.bytesSent = 0
+		info.bytesReceived = 0
+	}
+}
+
+type sessionInfo struct {
+	username      string
+	bytesReceived int64
+	bytesSent     int64
 }
 
 type customRelayAddressGenerator struct {
@@ -189,6 +289,23 @@ func createUDPListener(bindAddress string, isIPv6 bool) (net.PacketConn, error) 
 	if isIPv6 {
 		network = "udp6"
 	}
+
+	if isIPv6 {
+		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IPv6 UDP socket: %v", err)
+		}
+
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 1); err != nil {
+			syscall.Close(fd)
+			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %v", err)
+		}
+
+		file := os.NewFile(uintptr(fd), "")
+		defer file.Close()
+		return net.FilePacketConn(file)
+	}
+
 	return net.ListenPacket(network, bindAddress)
 }
 
@@ -197,23 +314,48 @@ func createTCPListener(bindAddress string, isIPv6 bool) (net.Listener, error) {
 	if isIPv6 {
 		network = "tcp6"
 	}
+
+	if isIPv6 {
+		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IPv6 TCP socket: %v", err)
+		}
+
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 1); err != nil {
+			syscall.Close(fd)
+			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %v", err)
+		}
+
+		tcpAddr, err := net.ResolveTCPAddr(network, bindAddress)
+		if err != nil {
+			syscall.Close(fd)
+			return nil, fmt.Errorf("failed to resolve TCP address: %v", err)
+		}
+		sockaddr := &syscall.SockaddrInet6{
+			Port: tcpAddr.Port,
+		}
+		copy(sockaddr.Addr[:], tcpAddr.IP.To16())
+		if err := syscall.Bind(fd, sockaddr); err != nil {
+			syscall.Close(fd)
+			return nil, fmt.Errorf("failed to bind IPv6 TCP socket: %v", err)
+		}
+
+		if err := syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+			syscall.Close(fd)
+			return nil, fmt.Errorf("failed to listen on IPv6 TCP socket: %v", err)
+		}
+
+		file := os.NewFile(uintptr(fd), "")
+		defer file.Close()
+		return net.FileListener(file)
+	}
+
 	return net.Listen(network, bindAddress)
 }
 
 func extractIP(bindAddress string) string {
 	ip, _, _ := net.SplitHostPort(bindAddress)
 	return strings.Trim(ip, "[]")
-}
-
-func (s *STUNTURNServer) handleAuth(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
-	logrus.Infof("Auth attempt: username=%s, realm=%s, srcAddr=%s", username, realm, srcAddr)
-	if len(username) > 0 {
-		key := turn.GenerateAuthKey(username, realm, username)
-		logrus.Infof("Generated auth key for user %s", username)
-		return key, true
-	}
-	logrus.Warnf("Auth failed for username: %s", username)
-	return nil, false
 }
 
 func StartTurnServer(cfg *config.Config) error {

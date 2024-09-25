@@ -12,7 +12,7 @@ import (
 
 func getClients(w http.ResponseWriter, r *http.Request) {
 	var clients []models.Client
-	result := db.DB.Order("last_connected desc").Limit(100).Find(&clients)
+	result := db.DB.Order("id desc").Limit(100).Find(&clients)
 	if result.Error != nil {
 		http.Error(w, result.Error.Error(), http.StatusInternalServerError)
 		return
@@ -23,7 +23,7 @@ func getClients(w http.ResponseWriter, r *http.Request) {
 }
 
 func StartWebServer(addr string, cfg *config.Config) error {
-	http.HandleFunc("/clients", basicAuthMiddleware(getClients, cfg))
+	http.HandleFunc("/clients", getClients)
 	logrus.Infof("Starting web server on %s", addr)
 	return http.ListenAndServe(addr, nil)
 }

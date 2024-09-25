@@ -2,10 +2,7 @@ package config
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
-
-	"github.com/common-nighthawk/go-figure"
 )
 
 const Version = "0.0.1"
@@ -36,9 +33,4 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 
 	return config, nil
-}
-
-func AsciiArt() {
-	figure.NewFigure("SimpleTurn", "doom", true).Print()
-	fmt.Println("\t\t\t\t\t\tVersion: ", Version)
 }

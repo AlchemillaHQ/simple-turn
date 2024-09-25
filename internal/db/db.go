@@ -1,8 +1,6 @@
 package db
 
 import (
-	"time"
-
 	"github.com/AlchemillaHQ/simple-turn/internal/db/models"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -12,28 +10,16 @@ var DB *gorm.DB
 
 func InitDB() error {
 	var err error
-	DB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	DB, err = gorm.Open(sqlite.Open("simple-turn.db"), &gorm.Config{})
 	if err != nil {
 		return err
 	}
 
-	return DB.AutoMigrate(&models.Client{})
-}
+	DB.Exec("PRAGMA journal_mode=WAL;")
+	DB.Exec("PRAGMA synchronous=1;")
+	DB.Exec("PRAGMA foreign_keys=ON;")
+	DB.Exec("PRAGMA cache_size=-64000;")
+	DB.Exec("PRAGMA busy_timeout=5000;")
 
-func LogClient(clientType, ip string, active *bool, username string) error {
-	client := models.Client{
-		Type:     clientType,
-		IP:       ip,
-		Username: username,
-		Active:   active,
-	}
-
-	result := DB.Where(models.Client{Type: clientType, IP: ip, Username: username}).
-		Attrs(models.Client{FirstConnected: time.Now()}).
-		Assign(models.Client{
-			LastConnected: time.Now(),
-			Active:        active,
-		}).FirstOrCreate(&client).Update("count", gorm.Expr("count + 1"))
-
-	return result.Error
+	return DB.AutoMigrate(&models.Client{}, &models.AuthKeys{})
 }
