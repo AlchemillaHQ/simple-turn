@@ -16,6 +16,9 @@ type Config struct {
 	IPv6Bind     string `json:"ipv6_bind"`
 	LogLevel     string `json:"log_level"`
 	AuthEndpoint string `json:"auth_endpoint"`
+	WebAddr      string `json:"web_addr"`
+	Username     string `json:"username"`
+	Password     string `json:"password"`
 }
 
 func LoadConfig(filename string) (*Config, error) {

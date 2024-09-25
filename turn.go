@@ -103,13 +103,15 @@ func (g *customRelayAddressGenerator) Validate() error {
 type monitoringPacketConn struct {
 	net.PacketConn
 	clientIP string
+	username string
 }
 
 func (m *monitoringPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	n, addr, err = m.PacketConn.ReadFrom(p)
 	if err == nil {
-		updateClientData("turn", m.clientIP, 0, int64(n))
-		updateClientActivity(m.clientIP)
+		ip, _, _ := net.SplitHostPort(addr.String())
+		fmt.Println("m.username at ReadFrom: ", m.username)
+		updateClientData("turn", ip, 0, int64(n), m.username)
 	}
 	return
 }
@@ -117,82 +119,11 @@ func (m *monitoringPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 func (m *monitoringPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	n, err = m.PacketConn.WriteTo(p, addr)
 	if err == nil {
-		updateClientData("turn", m.clientIP, int64(n), 0)
-		updateClientActivity(m.clientIP)
+		ip, _, _ := net.SplitHostPort(addr.String())
+		fmt.Println("m.username at WriteTo: ", m.username)
+		updateClientData("turn", ip, int64(n), 0, m.username)
 	}
 	return
-}
-
-type monitoringConn struct {
-	net.Conn
-	clientIP string
-}
-
-func (m *monitoringConn) Read(b []byte) (n int, err error) {
-	n, err = m.Conn.Read(b)
-	if err == nil {
-		updateClientData("turn", m.clientIP, 0, int64(n))
-		updateClientActivity(m.clientIP)
-	}
-	return
-}
-
-func (m *monitoringConn) Write(b []byte) (n int, err error) {
-	n, err = m.Conn.Write(b)
-	if err == nil {
-		updateClientData("turn", m.clientIP, int64(n), 0)
-		updateClientActivity(m.clientIP)
-	}
-	return
-}
-
-func updateClientActivity(clientIP string) {
-	clientsMutex.Lock()
-	defer clientsMutex.Unlock()
-
-	if timer, exists := activeClients[clientIP]; exists {
-		timer.Reset(clientTimeout)
-	} else {
-		activeClients[clientIP] = time.AfterFunc(clientTimeout, func() {
-			setClientInactive("turn", clientIP)
-			clientsMutex.Lock()
-			delete(activeClients, clientIP)
-			clientsMutex.Unlock()
-		})
-	}
-}
-
-func wrapPacketConn(conn net.PacketConn, clientIP string) net.PacketConn {
-	return &monitoringPacketConn{PacketConn: conn, clientIP: clientIP}
-}
-
-func wrapConn(conn net.Conn, clientIP string) net.Conn {
-	return &monitoringConn{Conn: conn, clientIP: clientIP}
-}
-
-type customRelayListener struct {
-	turn.RelayAddressGenerator
-	clientIP string
-}
-
-func (g *customRelayListener) AllocatePacketConn(network string, requestedPort int) (net.PacketConn, net.Addr, error) {
-	conn, addr, err := g.RelayAddressGenerator.AllocatePacketConn(network, requestedPort)
-	if err != nil {
-		return nil, nil, err
-	}
-	return wrapPacketConn(conn, g.clientIP), addr, nil
-}
-
-func (g *customRelayListener) AllocateConn(network string, requestedPort int) (net.Conn, net.Addr, error) {
-	conn, addr, err := g.RelayAddressGenerator.AllocateConn(network, requestedPort)
-	if err != nil {
-		return nil, nil, err
-	}
-	return wrapConn(conn, g.clientIP), addr, nil
-}
-
-type stunTurnPacketConn struct {
-	net.PacketConn
 }
 
 func (s *stunTurnPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -203,7 +134,7 @@ func (s *stunTurnPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error
 		}
 		if msg.Decode() == nil && msg.Type == stun.BindingRequest {
 			ip, _, _ := net.SplitHostPort(addr.String())
-			err := logClient("stun", ip, nil)
+			err := logClient("stun", ip, nil, "")
 			if err != nil {
 				logrus.Debugf("Failed to log STUN client connection: %v", err)
 			} else {
@@ -218,9 +149,88 @@ func (s *stunTurnPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error)
 	n, err = s.PacketConn.WriteTo(p, addr)
 	if err == nil {
 		ip, _, _ := net.SplitHostPort(addr.String())
-		updateClientData("stun", ip, int64(n), 0)
+		updateClientData("stun", ip, int64(n), 0, "") // Empty username for STUN
 	}
 	return
+}
+
+type monitoringConn struct {
+	net.Conn
+	clientIP string
+	username string
+}
+
+func (m *monitoringConn) Read(b []byte) (n int, err error) {
+	n, err = m.Conn.Read(b)
+	if err == nil {
+		updateClientData("turn", m.clientIP, 0, int64(n), m.username)
+		updateClientActivity(m.clientIP, m.username)
+	}
+	return
+}
+
+func (m *monitoringConn) Write(b []byte) (n int, err error) {
+	n, err = m.Conn.Write(b)
+	if err == nil {
+		updateClientData("turn", m.clientIP, int64(n), 0, m.username)
+		updateClientActivity(m.clientIP, m.username)
+	}
+	return
+}
+
+func updateClientActivity(clientIP, username string) {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+
+	key := clientIP + ":" + username
+	if timer, exists := activeClients[key]; exists {
+		timer.Reset(clientTimeout)
+	} else {
+		activeClients[key] = time.AfterFunc(clientTimeout, func() {
+			setClientInactive("turn", clientIP, username)
+			clientsMutex.Lock()
+			delete(activeClients, key)
+			clientsMutex.Unlock()
+		})
+	}
+}
+
+func wrapPacketConn(conn net.PacketConn, clientIP, username string) net.PacketConn {
+	return &monitoringPacketConn{PacketConn: conn, clientIP: clientIP, username: username}
+}
+
+func wrapConn(conn net.Conn, clientIP, username string) net.Conn {
+	return &monitoringConn{Conn: conn, clientIP: clientIP, username: username}
+}
+
+type customRelayListener struct {
+	turn.RelayAddressGenerator
+	clientIP string
+	username string
+}
+
+func (g *customRelayListener) SetUsername(username string) {
+	g.username = username
+}
+
+func (g *customRelayListener) AllocatePacketConn(network string, requestedPort int) (net.PacketConn, net.Addr, error) {
+	conn, addr, err := g.RelayAddressGenerator.AllocatePacketConn(network, requestedPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapPacketConn(conn, g.clientIP, g.username), addr, nil
+}
+
+func (g *customRelayListener) AllocateConn(network string, requestedPort int) (net.Conn, net.Addr, error) {
+	conn, addr, err := g.RelayAddressGenerator.AllocateConn(network, requestedPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapConn(conn, g.clientIP, g.username), addr, nil
+}
+
+type stunTurnPacketConn struct {
+	net.PacketConn
 }
 
 func wrapStunTurnPacketConn(conn net.PacketConn) net.PacketConn {
@@ -307,34 +317,8 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 	loggerFactory.DefaultLogLevel = logging.LogLevelDisabled
 
 	s, err := turn.NewServer(turn.ServerConfig{
-		Realm: config.Realm,
-		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
-			logrus.Debugf("TURN Auth request: username=%s, realm=%s, srcAddr=%s", username, realm, srcAddr.String())
-
-			resp, err := httpClient.Get(fmt.Sprintf("%s/%s", config.AuthEndpoint, username))
-			if err != nil {
-				logrus.Debugf("TURN Auth request failed: %v", err)
-				return nil, false
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				logrus.Debugf("TURN Auth request denied: status=%d", resp.StatusCode)
-				return nil, false
-			}
-
-			ip, _, _ := net.SplitHostPort(srcAddr.String())
-			active := true
-			err = logClient("turn", ip, &active)
-			if err != nil {
-				logrus.Debugf("Failed to log TURN client connection: %v", err)
-			} else {
-				logrus.Debugf("Logged TURN client connection: username=%s, ip=%s", username, ip)
-			}
-
-			updateClientActivity(ip)
-
-			return turn.GenerateAuthKey(username, realm, username), true
-		},
+		Realm:       config.Realm,
+		AuthHandler: createAuthHandler(config),
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
 				PacketConn: wrappedUDPListener,
@@ -345,6 +329,7 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 						isIPv6:       isIPv6,
 					},
 					clientIP: publicIP,
+					username: "",
 				},
 			},
 		},
