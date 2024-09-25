@@ -116,26 +116,53 @@ func logClient(clientType, ip string, active *bool) error {
 
 func updateClientData(clientType, ip string, dataSent, dataReceived int64) error {
 	logrus.Infof("Updating client data: type=%s, ip=%s, sent=%d, received=%d", clientType, ip, dataSent, dataReceived)
-	_, err := db.Exec(`
-        UPDATE clients
-        SET data_sent = data_sent + ?, data_received = data_received + ?, last_connected = CURRENT_TIMESTAMP
-        WHERE type = ? AND ip = ?
-    `, dataSent, dataReceived, clientType, ip)
 
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	// First, try to update existing record
+	result, err := tx.Exec(`
+		UPDATE clients
+		SET data_sent = data_sent + ?, data_received = data_received + ?, last_connected = CURRENT_TIMESTAMP
+		WHERE type = ? AND ip = ?
+	`, dataSent, dataReceived, clientType, ip)
 	if err != nil {
 		return fmt.Errorf("failed to update client data: %v", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %v", err)
+	}
+
+	// If no rows were affected, insert a new record
+	if rowsAffected == 0 {
+		_, err = tx.Exec(`
+			INSERT INTO clients (type, ip, first_connected, last_connected, count, active, data_sent, data_received)
+			VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, true, ?, ?)
+		`, clientType, ip, dataSent, dataReceived)
+		if err != nil {
+			return fmt.Errorf("failed to insert new client data: %v", err)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
 	return nil
 }
 
 func setClientInactive(clientType, ip string) error {
-	inactive := false
 	_, err := db.Exec(`
-        UPDATE clients
-        SET active = ?
-        WHERE type = ? AND ip = ?
-    `, inactive, clientType, ip)
+		UPDATE clients
+		SET active = false
+		WHERE type = ? AND ip = ?
+	`, clientType, ip)
 
 	if err != nil {
 		return fmt.Errorf("failed to set client inactive: %v", err)
@@ -146,11 +173,11 @@ func setClientInactive(clientType, ip string) error {
 
 func getClients(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`
-        SELECT id, type, ip, first_connected, last_connected, count, active, data_sent, data_received
-        FROM clients
-        ORDER BY last_connected DESC
-        LIMIT 100
-    `)
+		SELECT id, type, ip, first_connected, last_connected, count, active, data_sent, data_received
+		FROM clients
+		ORDER BY last_connected DESC
+		LIMIT 100
+	`)
 	if err != nil {
 		logrus.Errorf("Failed to query clients: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to query clients: %v", err), http.StatusInternalServerError)
