@@ -23,7 +23,7 @@ func getClients(w http.ResponseWriter, r *http.Request) {
 }
 
 func StartWebServer(addr string, cfg *config.Config) error {
-	http.HandleFunc("/clients", getClients)
+	http.HandleFunc("/clients", basicAuthMiddleware(getClients, cfg))
 	logrus.Infof("Starting web server on %s", addr)
 	return http.ListenAndServe(addr, nil)
 }

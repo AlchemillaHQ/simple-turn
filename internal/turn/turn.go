@@ -136,10 +136,11 @@ func (w *wrappedPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error)
 				host, _, _ := net.SplitHostPort(addr.String())
 				w.server.updateStunClient(host)
 			} else {
-				// This is likely a TURN message
-				username := "" // You need to extract the username from the TURN message
-				host, _, _ := net.SplitHostPort(addr.String())
-				w.server.updateTurnStats(host, username, 0, int64(n))
+				// Handle TURN message
+				var username stun.Username
+				if username.GetFrom(msg) == nil {
+					w.server.updateTurnStats(addr.String(), username.String(), 0, int64(n))
+				}
 			}
 		}
 	}
@@ -249,25 +250,15 @@ func (g *customRelayAddressGenerator) AllocatePacketConn(network string, request
 }
 
 func (g *customRelayAddressGenerator) AllocateConn(network string, requestedPort int) (net.Conn, net.Addr, error) {
-	var listener net.Listener
-	var err error
-	var listenAddress string
-
+	var listenAddr string
 	if g.isIPv6 {
-		listenAddress = fmt.Sprintf("[%s]:%d", g.address, requestedPort)
-		listener, err = net.Listen("tcp6", listenAddress)
+		listenAddr = fmt.Sprintf("[%s]:%d", g.address, requestedPort)
 	} else {
-		listenAddress = fmt.Sprintf("%s:%d", g.address, requestedPort)
-		listener, err = net.Listen("tcp4", listenAddress)
+		listenAddr = fmt.Sprintf("%s:%d", g.address, requestedPort)
 	}
 
+	conn, err := net.Dial(network, listenAddr)
 	if err != nil {
-		return nil, nil, err
-	}
-
-	conn, err := listener.Accept()
-	if err != nil {
-		listener.Close()
 		return nil, nil, err
 	}
 
