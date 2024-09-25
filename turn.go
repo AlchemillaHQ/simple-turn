@@ -8,11 +8,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/stun"
 	"github.com/pion/turn/v4"
 	"github.com/sirupsen/logrus"
 )
 
-var httpClient = &http.Client{Timeout: 5 * time.Second}
+var (
+	httpClient    = &http.Client{Timeout: 5 * time.Second}
+	clientsMutex  sync.Mutex
+	activeClients = make(map[string]*time.Timer)
+)
+
+const clientTimeout = 5 * time.Minute
 
 type customRelayAddressGenerator struct {
 	relayAddress net.IP
@@ -57,10 +64,8 @@ func (g *customRelayAddressGenerator) AllocateConn(network string, requestedPort
 		return nil, nil, fmt.Errorf("failed to create TCP listener: %v", err)
 	}
 
-	// Create a channel to receive the connection
 	connChan := make(chan net.Conn, 1)
 
-	// Start a goroutine to accept the connection
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -72,7 +77,6 @@ func (g *customRelayAddressGenerator) AllocateConn(network string, requestedPort
 		close(connChan)
 	}()
 
-	// Wait for the connection or timeout
 	select {
 	case conn := <-connChan:
 		if conn == nil {
@@ -104,6 +108,7 @@ func (m *monitoringPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 	n, addr, err = m.PacketConn.ReadFrom(p)
 	if err == nil {
 		updateClientData("turn", m.clientIP, 0, int64(n))
+		updateClientActivity(m.clientIP)
 	}
 	return
 }
@@ -112,6 +117,7 @@ func (m *monitoringPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 	n, err = m.PacketConn.WriteTo(p, addr)
 	if err == nil {
 		updateClientData("turn", m.clientIP, int64(n), 0)
+		updateClientActivity(m.clientIP)
 	}
 	return
 }
@@ -125,6 +131,7 @@ func (m *monitoringConn) Read(b []byte) (n int, err error) {
 	n, err = m.Conn.Read(b)
 	if err == nil {
 		updateClientData("turn", m.clientIP, 0, int64(n))
+		updateClientActivity(m.clientIP)
 	}
 	return
 }
@@ -133,8 +140,25 @@ func (m *monitoringConn) Write(b []byte) (n int, err error) {
 	n, err = m.Conn.Write(b)
 	if err == nil {
 		updateClientData("turn", m.clientIP, int64(n), 0)
+		updateClientActivity(m.clientIP)
 	}
 	return
+}
+
+func updateClientActivity(clientIP string) {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+
+	if timer, exists := activeClients[clientIP]; exists {
+		timer.Reset(clientTimeout)
+	} else {
+		activeClients[clientIP] = time.AfterFunc(clientTimeout, func() {
+			setClientInactive("turn", clientIP)
+			clientsMutex.Lock()
+			delete(activeClients, clientIP)
+			clientsMutex.Unlock()
+		})
+	}
 }
 
 func wrapPacketConn(conn net.PacketConn, clientIP string) net.PacketConn {
@@ -164,6 +188,42 @@ func (g *customRelayListener) AllocateConn(network string, requestedPort int) (n
 		return nil, nil, err
 	}
 	return wrapConn(conn, g.clientIP), addr, nil
+}
+
+type stunTurnPacketConn struct {
+	net.PacketConn
+}
+
+func (s *stunTurnPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = s.PacketConn.ReadFrom(p)
+	if err == nil && n >= 20 {
+		msg := &stun.Message{
+			Raw: p[:n],
+		}
+		if msg.Decode() == nil && msg.Type == stun.BindingRequest {
+			ip, _, _ := net.SplitHostPort(addr.String())
+			err := logClient("stun", ip, nil)
+			if err != nil {
+				logrus.Debugf("Failed to log STUN client connection: %v", err)
+			} else {
+				logrus.Debugf("Logged STUN client connection: ip=%s", ip)
+			}
+		}
+	}
+	return
+}
+
+func (s *stunTurnPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = s.PacketConn.WriteTo(p, addr)
+	if err == nil {
+		ip, _, _ := net.SplitHostPort(addr.String())
+		updateClientData("stun", ip, int64(n), 0)
+	}
+	return
+}
+
+func wrapStunTurnPacketConn(conn net.PacketConn) net.PacketConn {
+	return &stunTurnPacketConn{PacketConn: conn}
 }
 
 func StartServer(config *Config) error {
@@ -240,6 +300,8 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 		return fmt.Errorf("failed to parse IP address: %s", publicIP)
 	}
 
+	wrappedUDPListener := wrapStunTurnPacketConn(udpListener)
+
 	s, err := turn.NewServer(turn.ServerConfig{
 		Realm: config.Realm,
 		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
@@ -257,18 +319,21 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 			}
 
 			ip, _, _ := net.SplitHostPort(srcAddr.String())
-			err = logClient("turn", ip, true)
+			active := true
+			err = logClient("turn", ip, &active)
 			if err != nil {
-				logrus.Errorf("Failed to log TURN client connection: %v", err)
+				logrus.Debugf("Failed to log TURN client connection: %v", err)
 			} else {
-				logrus.Infof("Logged TURN client connection: username=%s, ip=%s", username, ip)
+				logrus.Debugf("Logged TURN client connection: username=%s, ip=%s", username, ip)
 			}
+
+			updateClientActivity(ip)
 
 			return turn.GenerateAuthKey(username, realm, username), true
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
-				PacketConn: udpListener,
+				PacketConn: wrappedUDPListener,
 				RelayAddressGenerator: &customRelayListener{
 					RelayAddressGenerator: &customRelayAddressGenerator{
 						relayAddress: relayIP,
