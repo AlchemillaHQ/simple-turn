@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/logging"
 	"github.com/pion/stun"
 	"github.com/pion/turn/v4"
 	"github.com/sirupsen/logrus"
@@ -302,6 +303,9 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 
 	wrappedUDPListener := wrapStunTurnPacketConn(udpListener)
 
+	loggerFactory := logging.NewDefaultLoggerFactory()
+	loggerFactory.DefaultLogLevel = logging.LogLevelDisabled
+
 	s, err := turn.NewServer(turn.ServerConfig{
 		Realm: config.Realm,
 		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
@@ -340,6 +344,7 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 						address:      publicIP,
 						isIPv6:       isIPv6,
 					},
+					clientIP: publicIP,
 				},
 			},
 		},
@@ -352,9 +357,11 @@ func startTURNServer(config *Config, isIPv6 bool) error {
 						address:      publicIP,
 						isIPv6:       isIPv6,
 					},
+					clientIP: publicIP,
 				},
 			},
 		},
+		LoggerFactory: loggerFactory,
 	})
 
 	if err != nil {

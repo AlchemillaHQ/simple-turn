@@ -115,6 +115,7 @@ func logClient(clientType, ip string, active *bool) error {
 }
 
 func updateClientData(clientType, ip string, dataSent, dataReceived int64) error {
+	logrus.Infof("Updating client data: type=%s, ip=%s, sent=%d, received=%d", clientType, ip, dataSent, dataReceived)
 	_, err := db.Exec(`
         UPDATE clients
         SET data_sent = data_sent + ?, data_received = data_received + ?, last_connected = CURRENT_TIMESTAMP
